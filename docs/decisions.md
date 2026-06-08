@@ -24,18 +24,22 @@ Short ADR-style notes on the non-obvious calls — what I picked, what I rejecte
 
 **Consequence.** The process Lambda uses two different boto3 clients with different regions (`bedrock = boto3.client("bedrock-runtime")` for default region, `bedrock_image = boto3.client("bedrock-runtime", region_name="us-west-2")` for Stability). The IAM policy is explicit about the resource ARNs across both regions, plus a `aws-marketplace:Subscribe` grant because Stability is billed via Marketplace and Bedrock InvokeModel requires the calling role to hold those actions even after the subscription is active.
 
+**Update.** The diagram model was upgraded from Stable Image Core to **Stable Image Ultra** (same BAA + us-west-2 region, materially better anatomical fidelity). Generation now retries up to 3 times and pins a fixed non-zero seed so the same document yields a reproducible diagram.
+
 ---
 
-## ADR-003 — Cognito User Pool with MFA-required, hosted UI
+## ADR-003 — Cognito User Pool with MFA-required, hosted UI *(superseded — see Update)*
 **Context.** Need a HIPAA-aligned auth surface that supports MFA and OAuth.
 
-**Decision.** Cognito User Pool with `mfa_configuration = "ON"` + TOTP, hosted UI for the sign-in flow, custom domain (`auth.dev.explainmyscanapp.com`), expo-auth-session (PKCE) on the client.
+**Decision.** Cognito User Pool with `mfa_configuration = "ON"` + TOTP, hosted UI for the sign-in flow, custom domain (`auth.dev.explainmyreports.com`), expo-auth-session (PKCE) on the client.
 
 **Why.** Cognito is the AWS BAA path. Hosted UI saves implementing sign-in / sign-up / forgot-password flows. PKCE is the right OAuth pattern for a public client (no client secret). The custom domain is a branding win without significant cost or complexity once the parent's A-record prereq is satisfied.
 
 **Rejected.** Auth0 (separate BAA needed; vendor lock-in concerns), Firebase Auth (no AWS BAA equivalent), implementing sign-up flows in the SPA (huge surface area for not much value).
 
 **Notes.** The `aws.cognito.signin.user.admin` scope is the non-obvious requirement for SPA-side ChangePassword / DeleteUser / UpdateUserAttributes. Default `openid email profile` doesn't authorize those calls — Cognito returns "Access Token does not have required scopes" without it.
+
+**Update — superseded by an in-app auth surface.** The hosted UI + OAuth-code-grant flow was replaced by a custom in-app flow that calls the Cognito IDP directly with `USER_PASSWORD_AUTH` (and handles the `SOFTWARE_TOKEN_MFA` challenge in-app). Owning sign-up / confirm / sign-in / forgot-reset lets the SPA branch on Cognito error codes — most importantly auto-resending the code and routing to the confirmation screen on `UserNotConfirmedException` instead of dead-ending. MFA also moved from required (`mfa_configuration = "ON"`) to **optional, self-service** (`"OPTIONAL"`) — enabled or disabled from Settings. The hosted-UI Terraform still exists but is no longer in the request path. See ADR-004, which now covers the whole auth surface rather than just the Settings RPCs.
 
 ---
 
@@ -47,6 +51,8 @@ Short ADR-style notes on the non-obvious calls — what I picked, what I rejecte
 **Why.** aws-amplify is ~400 KB minified, brings in a huge dependency tree, and adds zero functionality beyond what `fetch + X-Amz-Target` headers already give you. The Cognito IDP is just JSON-over-HTTPS with a header.
 
 **Consequence.** The web bundle is ~400 KB smaller. Pattern is the same across all five RPCs — the wrapper is dead simple.
+
+**Update.** When auth moved in-app (see ADR-003), this same hand-rolled approach scaled to the *entire* auth surface — `InitiateAuth` (USER_PASSWORD_AUTH), the `SOFTWARE_TOKEN_MFA` challenge, sign-up, confirm, resend, and forgot/reset — not just the Settings RPCs. Still no aws-amplify; `app/lib/cognito.ts` keys off the Cognito `__type` error codes so screens can branch (e.g. resend confirmation, redirect to MFA).
 
 ---
 
@@ -97,14 +103,16 @@ Short ADR-style notes on the non-obvious calls — what I picked, what I rejecte
 
 **Implementation notes.** `fpdf2` instead of WeasyPrint (no system deps), default Helvetica with latin-1 transliteration for the smart quotes and em-dashes that Sonnet emits, emojis stripped (they're already in section titles which get rendered as plain caps). The diagram is written to /tmp temporarily so `pdf.image()` can read it. ~13 MB zipped lambda bundle.
 
+**Update — PDF generation moved to headless Chromium.** The `fpdf2` reconstruction never quite matched the website's detail page. It was replaced by a dedicated `pdf-render` Lambda that renders each PDF from the *same* HTML/CSS as the detail page using **headless Chromium via Playwright**, so the export is page-faithful. Rendering is idempotent on a canonical S3 key and triggered by SNS when a doc completes (or synchronously by the read Lambda to backfill older docs); the export Lambda just zips the resulting per-doc PDFs.
+
 ---
 
 ## ADR-009 — Custom MAIL FROM for SPF alignment
-**Context.** Completion emails from `noreply@explainmyscanapp.com` were landing in Gmail spam even though SES delivered cleanly and DKIM passed.
+**Context.** Completion emails from `noreply@explainmyreports.com` were landing in Gmail spam even though SES delivered cleanly and DKIM passed.
 
-**Decision.** Configure a custom MAIL FROM domain at `bounce.explainmyscanapp.com` with its own SPF TXT and MX → `feedback-smtp.<region>.amazonses.com`.
+**Decision.** Configure a custom MAIL FROM domain at `bounce.explainmyreports.com` with its own SPF TXT and MX → `feedback-smtp.<region>.amazonses.com`.
 
-**Why.** Without a custom MAIL FROM, SES uses `*.amazonses.com` as the envelope-from. The visible From: domain (`explainmyscanapp.com`) and the envelope-from domain (`amazonses.com`) don't align, so DMARC's SPF half fails. DKIM still passes, the email still delivers — but Gmail downgrades the trust score and routes to spam.
+**Why.** Without a custom MAIL FROM, SES uses `*.amazonses.com` as the envelope-from. The visible From: domain (`explainmyreports.com`) and the envelope-from domain (`amazonses.com`) don't align, so DMARC's SPF half fails. DKIM still passes, the email still delivers — but Gmail downgrades the trust score and routes to spam.
 
 With the custom MAIL FROM, both domains align. DMARC passes both halves.
 
@@ -149,7 +157,7 @@ This means a developer on macOS Python 3.14 can still produce a lambda-runnable 
 
 ## What I'd do differently in v2
 
-- **Build the prod environment alongside dev from the start.** Single-env Terraform feels simpler but doesn't reveal the prod-specific work (apex SPA vs landing collision, separate KMS, separate Cognito) until you go to stand up prod. Better to scaffold both early.
+- **Build the prod environment alongside dev from the start.** Single-env Terraform feels simpler but doesn't reveal the prod-specific work (apex SPA vs landing collision, separate KMS, separate Cognito) until you go to stand up prod. Better to scaffold both early. *(Done — a prod stack now runs at `app.explainmyreports.com`, with shared-singleton resources gated to dev's state and referenced by prod.)*
 - **Pick Sentry once it's affordable.** RUM works but its triage UX really is rough.
 - **EAS Build hooked up for native builds early.** The Expo Router native paths exist but I've only ever tested them via `expo start`. EAS Build for iOS/Android is a few config knobs but worth doing before the codebase grows.
-- **Real CI.** All 22 PRs shipped without CI; tests ran locally before push. That's fine for one developer but doesn't scale to even two.
+- **Real CI.** *(Done — GitHub Actions now runs pytest + `tsc --noEmit` + `terraform validate` as the merge gate, with deploys triggered via `workflow_dispatch` and OIDC federation. The early PRs shipped without it; CI landed as the project grew past the first dozen.)*

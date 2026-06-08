@@ -7,9 +7,9 @@ A walkthrough of how the system is wired together, what each module owns, and th
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                          Public surfaces                            │
-│  explainmyscanapp.com (marketing)     dev.explainmyscanapp.com (app)│
-│  www.explainmyscanapp.com (alias)     api.dev.explainmyscanapp.com  │
-│                                       auth.dev.explainmyscanapp.com │
+│  explainmyreports.com (marketing)     dev.explainmyreports.com (app)│
+│  www.explainmyreports.com (alias)     api.dev.explainmyreports.com  │
+│                                       auth.dev.explainmyreports.com │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
@@ -37,11 +37,11 @@ A walkthrough of how the system is wired together, what each module owns, and th
 
 ## Module-by-module
 
-### `auth` — Cognito + custom domain
-- **User Pool**: email username, MFA-required TOTP, 12-char password policy with mixed case + digits + symbols, `verify-before-update` on email so a typo doesn't lock anyone out.
-- **App client** with PKCE-only flow, scopes `openid email profile aws.cognito.signin.user.admin` (the last one is the non-obvious requirement for SPA-side ChangePassword / DeleteUser / UpdateUserAttributes).
-- **Custom domain** at `auth.dev.explainmyscanapp.com` backed by us-east-1 ACM cert + Route 53 A alias to Cognito's CloudFront distribution (zone ID `Z2FDTNDATAQYW2`). Cognito requires the parent domain to have an A record first; nesting the subdomain under `dev.<root>` reuses the app's frontend alias and dodges apex-DNS gymnastics.
-- **Hosted UI customization**: brand cyan submit button, focus ring, redirect links, 224-px brand logo (Cognito caps `imageFile` at ~96 KB raw / 128 KB base64).
+### `auth` — Cognito User Pool + in-app auth surface
+- **User Pool**: email username, optional self-service TOTP MFA (`mfa_configuration = "OPTIONAL"`), 12-char password policy with mixed case + digits + symbols, `verify-before-update` on email so a typo doesn't lock anyone out.
+- **App client** with `ALLOW_USER_PASSWORD_AUTH`. The SPA hits the Cognito IDP HTTPS endpoint directly for the full auth surface — sign-up, confirm, sign-in, the `SOFTWARE_TOKEN_MFA` challenge, forgot/reset password — plus account actions (ChangePassword, DeleteUser, UpdateUserAttributes). Hand-rolling keeps aws-amplify (~400 KB) out of the web bundle and lets each screen branch on Cognito error codes (e.g. auto-resend on `UserNotConfirmedException`).
+- **PostConfirmation trigger** (`welcome` Lambda): sends a branded welcome email the moment a new user verifies their sign-up code. Deliberately skips the forgot-password PostConfirmation so a returning user resetting a password isn't re-welcomed; failures are swallowed/logged so a flaky email never blocks registration.
+- **Hosted UI** (custom domain + ACM cert + Route 53 alias) is still provisioned in Terraform from the original OAuth-code-grant design, but the shipped app no longer routes through it — auth is entirely in-app.
 
 ### `frontend` — SPA via S3 + CloudFront
 - KMS-encrypted bucket, blocked public access, CloudFront with **OAC** (not legacy OAI) so the bucket policy can require `AWS:SourceArn` matches the distribution.
@@ -50,26 +50,28 @@ A walkthrough of how the system is wired together, what each module owns, and th
 - Route 53 A + AAAA aliases for IPv6 coverage.
 
 ### `landing` — marketing site
-- Independent S3 bucket + CloudFront distribution at the apex `explainmyscanapp.com` + `www.<root>`. Separate cert; separate KMS-encrypted bucket; single static HTML file with the real logo at 88 px in the header.
+- Independent S3 bucket + CloudFront distribution at the apex `explainmyreports.com` + `www.<root>`. Separate cert; separate KMS-encrypted bucket; single static HTML file with the real logo at 88 px in the header.
 - The frontend module's CSP gates work fine here too — apex CSP is much stricter (`default-src 'self'`) since the landing has no third-party scripts.
 
 ### `api` — API Gateway + WAF + custom domain
 - REST API (not HTTP API — needed Cognito User Pool authorizer with WAF integration).
 - WAF web ACL with the **AWS Managed Common Rule Set** + SQLi rule set. `SizeRestrictions_BODY` and `CrossSiteScripting_BODY` are explicitly overridden to count-only because they false-positive every multipart upload.
-- Custom domain `api.dev.explainmyscanapp.com` with its own regional ACM cert and base-path mapping.
+- Custom domain `api.dev.explainmyreports.com` with its own regional ACM cert and base-path mapping.
 - Cognito JWT validation in the authorizer config — `identity_source = "method.request.header.Authorization"`.
 - Per-stage CloudWatch access logging at JSON format (encrypted with the customer KMS key, 90-day retention).
 
-### `processing` — the async pipeline + the read/export lambdas
+### `processing` — the async pipeline + the read / export / render / health lambdas
 - **Upload Lambda** (256 MB / 30 s): multipart parse, file-type whitelist, 10 MB cap, S3 put, DDB put with `status=processing`, SQS send with the doc tuple.
 - **Process Lambda** (512 MB / 5 min): the heavy lifter. Branches on file type:
   - SVG → regex strip → Bedrock
   - PNG/JPG/GIF/WEBP → Textract `DetectDocumentText` (sync) → Bedrock
   - PDF → `pypdf` text extraction; if empty (scanned PDF), `StartDocumentTextDetection` → SNS callback → `GetDocumentTextDetection` → Bedrock
-  - After Bedrock summary completes: `StartDocumentTextDetection` is not used here; instead the summary's diagram-description sentence is fed to Stability AI in us-west-2, then a second Claude pass calibrates label positions on the returned image.
-- **Read Lambda** (256 MB / 15 s): handles GET /documents, GET /documents/{id}, GET /documents/{id}/download, DELETE /documents/{id}, POST /documents/{id}/retry, DELETE /account. Issues presigned URLs (SigV4 — required for KMS-encrypted objects).
-- **Export Lambda** (1024 MB / 60 s, isolated from read so the hot path stays cheap): builds the per-doc PDF + zip in /tmp using `fpdf2`, uploads to `s3://.../exports/{userId}/{exportId}.zip` with `Content-Disposition: attachment` set on the object metadata, returns a 1-hour presigned URL.
+  - After Bedrock summary completes: the summary's diagram-description sentence is fed to Stability **Stable Image Ultra** in us-west-2 (up to 3 attempts, fixed non-zero seed for reproducibility), then a second Claude pass calibrates label positions on the returned image. On completion it publishes an SNS message so the `pdf-render` Lambda can build the summary PDF out-of-band.
+- **Read Lambda** (256 MB / 15 s): handles GET /documents, GET /documents/{id}, GET /documents/{id}/download, DELETE /documents/{id}, POST /documents/{id}/retry, DELETE /account. Issues presigned URLs (SigV4 — required for KMS-encrypted objects). If a pre-existing doc is missing its `summaryPdfKey`, it invokes `pdf-render` synchronously to backfill it.
+- **PDF-render Lambda**: renders a per-doc summary PDF from the *same* HTML/CSS as the website's detail page using headless Chromium (Playwright), so the export mirrors the real page rather than an `fpdf2` reconstruction. Idempotent on a canonical S3 key; invoked two ways — by SNS when a doc completes, or synchronously by the read Lambda for older docs.
+- **Export Lambda** (isolated from read so the hot path stays cheap): zips the per-doc PDFs produced by `pdf-render`, uploads to `s3://.../exports/{userId}/{exportId}.zip` with `Content-Disposition: attachment` on the object metadata, returns a 1-hour presigned URL.
 - **DLQ Processor Lambda** (256 MB / 30 s): SQS-triggered from the processing DLQ (after `maxReceiveCount=3`). Conditional `UpdateItem` flips stuck rows to `failed`, with `ConditionExpression: #s <> :complete` to dodge the race where a slow-but-successful run finishes after the DLQ message lands.
+- **Health Lambda**: public `GET /health` (no auth). Checks the three dependencies the pipeline needs (DynamoDB, S3, SQS) plus DLQ depth, and always returns 200 with a `status` of `ok` / `degraded` / `down` in the body so the status page's polling loop can treat any non-200 as "down" unambiguously.
 
 ### `storage` — KMS, S3, DynamoDB
 - **Customer-managed KMS key** with policy granting CloudTrail, CloudWatch Logs, SQS, SNS, S3 server-side encryption, and CloudFront (via OAC source ARN) decrypt. KMS key policy lives at the root module — putting it inside `storage` or `frontend` would create a module cycle.
@@ -88,7 +90,7 @@ A walkthrough of how the system is wired together, what each module owns, and th
 - **Custom MAIL FROM** at `bounce.<root>` with its own SPF TXT and MX → `feedback-smtp.<region>.amazonses.com`. Aligns the envelope-from with the visible From: header so DMARC's SPF half passes.
 - **DMARC** TXT at `_dmarc.<root>` in monitor mode (`p=none; aspf=r; adkim=r`) — Gmail weights the *presence* of a DMARC opinion even at p=none.
 - **Sandbox recipient identity** for dev testing (gets a verification email from AWS).
-- **Friendly From** uses display-name format (`"ExplainMyScan" <noreply@…>`) plus **Reply-To** at `support@<root>`.
+- **Friendly From** uses display-name format (`"ExplainMyReports" <noreply@…>`) plus **Reply-To** at `support@<root>`.
 
 ## Failure modes we designed for
 
@@ -106,9 +108,10 @@ A walkthrough of how the system is wired together, what each module owns, and th
 
 ## Observability surfaces
 
-- **CloudWatch ops dashboard** for at-a-glance health: `https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=explainmyscan-ops-dev`
-- **CloudWatch RUM** for client-side errors + page-load timing: `https://us-east-1.console.aws.amazon.com/rum/home?region=us-east-1#/monitors/details/explainmyscan-dev`
+- **CloudWatch ops dashboard** for at-a-glance health: `https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=explainmyreports-ops-dev`
+- **CloudWatch RUM** for client-side errors + page-load timing: `https://us-east-1.console.aws.amazon.com/rum/home?region=us-east-1#/monitors/details/explainmyreports-dev`
 - **DLQ depth alarm** with optional email subscription
+- **Public status page** backed by the `health` Lambda's `GET /health` (DynamoDB / S3 / SQS checks + DLQ depth → `ok` / `degraded` / `down`)
 - **Per-Lambda log groups**, KMS-encrypted with the customer key, 90-day retention
 - **API Gateway access log** with structured JSON (requestId, sourceIp, requestTime, httpMethod, resourcePath, status, latency)
 
@@ -116,5 +119,5 @@ A walkthrough of how the system is wired together, what each module owns, and th
 
 - **Multi-region**: us-east-1 only. DDB is single-region, S3 has no replication. v1 launch decision — add it before scaling beyond one region's blast radius.
 - **Dead-letter persistence**: DLQ messages live 14 days max (SQS limit). Long-term audit trail would copy them to S3 before expiry. Noted in the SQS module's comment; not implemented yet.
-- **A separate prod environment**: dev is the only deployed workspace today. The Terraform is parameterized for it — `environment = "prod"` would stand up a parallel stack — but actually doing the apply (+ DNS shuffle for the SPA vs landing at the apex) is its own task.
-- **Sign-up email customization**: Cognito's default sign-up verification email is bare. Custom SES sender is configured but the templates aren't yet swapped.
+
+> **Since shipped.** A separate **prod** environment now exists (`app.explainmyreports.com`), standing alongside dev with shared-singleton resources (SES domain identity, apex DNS, the landing site) gated to dev's state and referenced by prod. A branded **welcome email** also ships now via the `welcome` PostConfirmation Lambda, though Cognito's built-in verification email template is still the default.
